@@ -1,0 +1,325 @@
+---
+title: "Using Tidycensus to Obtain Census Data"
+output:
+  rmdformats::html_docco:
+    self_contained: true # Other options are downcute, material, readthedown, html_clean, html_docco, lockdown, https://github.com/juba/rmdformats
+    thumbnails: false
+    lightbox: true
+    gallery: false
+    highlight: kate
+    number_sections: false
+---
+
+## Libraries
+
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = F, cache = T, warning = F, message = F)
+options(tigris_use_cache = TRUE) # For caching maps
+library(tidyverse)
+library(tidycensus)
+library(leaflet)
+library(sf)
+library(viridis)
+# remotes::install_github("tylermorganwall/rayshader")
+# library(rayshader)
+library(rgl)
+library(devout)
+library(devoutrgl)
+library(ggrgl)
+theme_set(theme_void() + theme(plot.title = element_text(hjust = 0.5)))
+```
+
+## Setup
+
+```{r}
+# Installing census api key, install only necessary once for adding to Renvironment
+# census_api_key("aa7dad57625fd3a7f42a8066e1f3a2ea3ff31ed7", install = T)
+# Renvironment needs to be reread
+# readRenviron("~/.Renviron")
+# Check key install with
+# Sys.getenv("CENSUS_API_KEY")
+```
+
+By default, specifying "population", "components", or "housing" as the product in get_estimates() returns all variables associated with that component. For example, we can request all components of change variables for US states in 2017:
+
+```{r}
+us_population <- get_estimates(geography = "state", product = "population")
+unique(us_population$variable)
+
+us_components <- get_estimates(geography = "state", product = "components")
+us_components
+
+```
+
+## A Density Example
+
+US is CRAZY low density.
+
+```{r}
+us_county_density <- get_estimates(geography = "county",
+                                   variables = "DENSITY",
+                                   geometry = T,
+                                   shift_geo = T)
+
+ggplot(us_county_density, aes(fill = value, color = value)) +
+  geom_sf() +
+  scale_fill_distiller(palette = "Purples", direction = 1) +
+  scale_color_distiller(palette = "Purples", direction = 1)
+```
+
+Take a look in 3d!
+
+```{r}
+us_state_density <- get_estimates(geography = "state",
+                                   variables = "DENSITY",
+                                   geometry = T,
+                                   shift_geo = T)
+
+states_map <- map_data("state") %>%
+  mutate(region = str_to_title(region))
+threed_map <- left_join(states_map, us_state_density, by = c("region" = "NAME"))
+
+p <- ggplot(threed_map, aes(long, lat, group = group)) +
+  geom_polygon_z(aes(fill = value, z = value), color = "white", extrude = TRUE)+
+  scale_fill_viridis_c(option = "C") +
+  theme_ggrgl() + 
+  labs(title = "US Population Density") + 
+  coord_fixed(1.2)
+
+devoutrgl::rgldev(fov = 30, view_angle = -30)
+p
+invisible(dev.off())
+```
+
+
+## A Migration Example
+
+```{r}
+net_migration <- get_estimates(geography = "county",
+                               variables = "RNETMIG",
+                               geometry = TRUE,
+                               shift_geo = TRUE)
+order = c("-15 and below", "-15 to -5", "-5 to +5", "+5 to +15", "+15 and up")
+
+net_migration <- net_migration %>%
+  mutate(groups = case_when(
+    value > 15 ~ "+15 and up",
+    value > 5 ~ "+5 to +15",
+    value > -5 ~ "-5 to +5",
+    value > -15 ~ "-15 to -5",
+    TRUE ~ "-15 and below"
+  )) %>%
+  mutate(groups = factor(groups, levels = order))
+
+ggplot() +
+  geom_sf(data = net_migration, aes(fill = groups, color = groups), lwd = 0.1) +
+  geom_sf(data = tidycensus::state_laea, fill = NA, color = "black", lwd = 0.1) +
+  scale_fill_brewer(palette = "PuOr", direction = -1) +
+  scale_color_brewer(palette = "PuOr", direction = -1, guide = FALSE) +
+  coord_sf(datum = NA) +
+  theme_minimal(base_family = "Roboto") +
+  labs(title = "Net migration per 1000 residents by county",
+       subtitle = "US Census Bureau 2019 Population Estimates",
+       fill = "Rate")
+```
+
+
+
+## A Couple Mapping Examples
+
+Getting Oregon population data by county, and then getting a color for percentile using n = 10 to plot a leaflet.
+
+```{r}
+oregon_pop <- get_acs(geography = "tract",
+                     variables = "B01003_001",
+                     state = "OR",
+                     geometry = TRUE)
+
+pal <- colorQuantile("Blues", domain = oregon_pop$estimate, n = 10)
+
+oregon_pop %>% 
+  st_transform(crs = "+init=epsg:4326") %>%
+  leaflet(width = "100%") %>%
+  addProviderTiles(provider = "CartoDB.Positron") %>%
+  addPolygons(popup = ~ str_extract(NAME, "^([^,]*)"),
+              stroke = FALSE,
+              smoothFactor = 0,
+              fillOpacity = 0.7,
+              color = ~ pal(estimate)) %>%
+  addLegend("bottomright", 
+            pal = pal, 
+            values = ~ estimate,
+            title = "Population percentiles",
+            opacity = 1)
+```
+
+Plot a specific county by tract with ggplot.
+
+```{r}
+benton <- get_acs(geography = "tract", variables = "B19013_001",
+                state = "OR", county = "Benton", geometry = TRUE)
+
+ggplot(data = benton, aes(fill = estimate, color = estimate)) +
+  geom_sf() +
+  coord_sf(crs = 26914) +
+  scale_fill_viridis(option = "magma") +
+  scale_color_viridis(option = "magma")
+```
+
+Plot the US by county with leaflet
+
+```{r}
+us <- unique(fips_codes$state)[1:51]
+
+totalpop_county_sf <- map_df(us, function(x) {
+  get_acs(geography = "county", variables = "B01003_001",
+          state = x, geometry = TRUE) # Do without geometry = T for more just population information
+})
+
+pal <- colorNumeric(palette = "viridis", domain = totalpop_county_sf$estimate) # Numeric color palette
+
+totalpop_county_sf %>% # to filter by state do filter(grepl("Oregon", NAME)) %>%
+  st_transform(crs = "+init=epsg:4326") %>%
+  leaflet(width = "100%") %>%
+  addProviderTiles(provider = "CartoDB.Positron") %>%
+  addPolygons(popup = ~ str_extract(NAME, "^([^,]*)"),
+              stroke = FALSE,
+              smoothFactor = 0,
+              fillOpacity = 0.7,
+              color = ~ pal(estimate)) %>%
+  addLegend("bottomright", 
+            pal = pal, 
+            values = ~ estimate,
+            title = "Population Estimate",
+            labFormat = labelFormat(),
+            opacity = 1)
+```
+
+Ggplot the US by state excluding Alaska and the US. Also includes geom_sf_text, which amusingly labels Michigan in the Upper Peninsula.
+
+```{r}
+totalpop_state_sf <- map_df(us, function(x) {
+  get_acs(geography = "state", variables = "B01003_001",
+          state = x, geometry = TRUE) # Do without geometry = T for more just population information
+})
+# Code to do this the old way, creating an X and Y for the center of each state
+# states <- st_as_sf(maps::map("state", plot = FALSE, fill = TRUE)) %>%
+#   mutate(ID = str_to_title(ID)) %>%
+#   rename(NAME = ID) 
+# states <- states %>% 
+#   bind_cols(centroid = st_geometry(st_centroid(states))) %>%
+#   mutate(centroid = str_remove(centroid, "c\\(")) %>%
+#   mutate(centroid = str_remove(centroid, "\\)")) %>%
+#   separate(centroid, c("X", "Y"), sep = ", ") %>%
+#   st_set_geometry(NULL)
+# 
+# totalpop_state_sf <- totalpop_state_sf %>% left_join(states, by = c("NAME"))
+
+uspop_plot <- totalpop_state_sf %>%
+  dplyr::filter(NAME != "Alaska" & NAME != "Hawaii") %>%
+  ggplot(aes(fill = estimate)) +
+  geom_sf() +
+  geom_sf_text(aes(label = format(estimate, big.mark = ",", scientific = F)), size = 2) +
+  coord_sf(crs = 26914) +
+  scale_fill_distiller(palette = "Blues", direction = 1, labels = scales::comma) +
+  labs(fill = "Population", title = "State Populations")
+```
+
+Function for tract by state leaflet map of home values, state parameter should be "OR" format
+
+```{r echo = F}
+stateHome <- function(state) {
+  stateValue <- get_acs(geography = "tract", 
+                    variables = "B25077_001", 
+                    state = state,
+                    geometry = TRUE)
+
+  pal <- colorNumeric(palette = "Blues", 
+                    domain = stateValue$estimate)
+
+  stateValue %>%
+    st_transform(crs = "+init=epsg:4326") %>%
+    leaflet(width = "100%") %>%
+    addProviderTiles(provider = "CartoDB.Positron") %>%
+    addPolygons(popup = ~ str_extract(NAME, "^([^,]*)"),
+                stroke = FALSE,
+                smoothFactor = 0,
+                fillOpacity = 0.7,
+                color = ~ pal(estimate)) %>%
+    addLegend("bottomright", 
+              pal = pal, 
+              values = ~ estimate,
+              title = "Median Home Value",
+              labFormat = labelFormat("$"),
+              opacity = 1)
+}
+stateHome("CA") #Pretty sick
+```
+
+State by state leaflet of rent cost.
+
+```{r echo = F}
+stateRent <- function(state) {
+  rent <- get_acs(geography = "tract", variables = "DP04_0134", 
+                state = state, geometry = TRUE)
+  pal <- colorNumeric(palette = "viridis", domain = rent$estimate)
+  rent %>%
+    st_transform(crs = "+init=epsg:4326") %>%
+    leaflet(width = "100%") %>%
+    addProviderTiles(provider = "CartoDB.Positron") %>%
+    addPolygons(popup = ~ str_extract(NAME, "^([^,]*)"),
+                stroke = FALSE,
+                smoothFactor = 0,
+                fillOpacity = 0.7,
+                color = ~ pal(estimate)) %>%
+    addLegend("bottomright", 
+              pal = pal, 
+              values = ~ estimate,
+              title = paste("Rent in", state),
+              labFormat = labelFormat("$"),
+              opacity = 1)
+}
+
+stateRent(state = c("WA", "OR", "CA"))
+```
+
+
+Tract by state income.
+
+```{r echo = F}
+stateIncome <- function(state) {
+  income <- get_acs(geography = "tract", variables = c(medincome = "B19013_001"), 
+                  state = state, geometry = TRUE)
+  pal <- colorNumeric(palette = "Reds", domain = income$estimate)
+  income %>%
+    st_transform(crs = "+init=epsg:4326") %>%
+    leaflet(width = "100%") %>%
+    addProviderTiles(provider = "CartoDB.Positron") %>%
+    addPolygons(popup = ~ str_extract(NAME, "^([^,]*)"),
+                stroke = FALSE,
+                smoothFactor = 0,
+                fillOpacity = 0.7,
+                color = ~ pal(estimate)) %>%
+    addLegend("bottomright", 
+              pal = pal, 
+              values = ~ estimate,
+              title = paste("Income in", state),
+              labFormat = labelFormat("$"),
+              opacity = 1)
+}
+
+stateIncome("OR")
+stateIncome("NY")
+```
+
+
+
+
+
+
+
+
+
+
+
+
